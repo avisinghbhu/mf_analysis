@@ -34,46 +34,36 @@ from pandas.tseries.offsets import DateOffset
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Ensure local vendored mftool is available (AMFI-only, no MFAPI)
-# ────────────────────────────────────────────────────────────────────────────────
 
-def _ensure_local_mftool():
-    """Try to import mftool; if it fails, download repo files to a writable folder
-    (./mftool or /tmp/mftool), add that folder to sys.path, then import again.
-    This keeps AMFI (via mftool) as the sole data source.
-    """
+# ────────────────────────────────────────────────────────────────────────────────
+# Ensure local mftool (AMFI-only). Non-fatal: returns bool and never raises.
+# ────────────────────────────────────────────────────────────────────────────────
+def _ensure_local_mftool() -> bool:
     try:
         from mftool import Mftool  # noqa: F401
-        return
+        return True
     except Exception:
         pass
 
-    import zipfile
+    # 1) Try vendoring from GitHub ZIP into a writable folder (prefer /tmp)
+    import io as _io, zipfile, sys as _sys, shutil
+    from pathlib import Path as _Path
+    import requests as _requests
 
-    # Choose a writable base folder
-    candidates = [Path.cwd(), Path("/tmp")]
-    REF = "master"  # you may pin a tag/commit here, e.g., "v2.5" or a SHA
-    ZIP_URL = f"https://codeload.github.com/NayakwadiS/mftool/zip/refs/heads/{REF}"
+    CANDIDATES = [_Path("/tmp"), _Path.cwd()]
+    REF = "v2.5"  # stable tag; change to "master" or a commit SHA if you prefer
+    ZIP_URL = f"https://codeload.github.com/NayakwadiS/mftool/zip/refs/tags/{REF}"
 
-    for base in candidates:
+    for base in CANDIDATES:
         try:
             pkg_dir = base / "mftool"
-            # Clean if exists
             if pkg_dir.exists():
-                for p in sorted(pkg_dir.rglob("*"), reverse=True):
-                    if p.is_file():
-                        p.unlink()
-                for p in sorted(pkg_dir.rglob("*"), reverse=True):
-                    if p.is_dir():
-                        p.rmdir()
+                shutil.rmtree(pkg_dir, ignore_errors=True)
             pkg_dir.mkdir(parents=True, exist_ok=True)
 
-            # Download zip
-            r = requests.get(ZIP_URL, timeout=60)
+            r = _requests.get(ZIP_URL, timeout=60)
             r.raise_for_status()
-            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                # Top-level dir name in archive (e.g., "mftool-master/")
+            with zipfile.ZipFile(_io.BytesIO(r.content)) as z:
                 tops = sorted({n.split("/")[0] for n in z.namelist()})
                 top = [t for t in tops if t.startswith("mftool-")][0]
                 needed = ["__init__.py", "mftool.py", "utils.py", "const.json", "scheme_codes.json"]
@@ -81,19 +71,27 @@ def _ensure_local_mftool():
                     with z.open(f"{top}/{fn}") as src, open(pkg_dir / fn, "wb") as dst:
                         dst.write(src.read())
 
-            # Ensure path and import
-            if str(base) not in sys.path:
-                sys.path.insert(0, str(base))
+            if str(base) not in _sys.path:
+                _sys.path.insert(0, str(base))
             from mftool import Mftool  # noqa: F401
-            return
+            return True
         except Exception:
             continue
 
-    raise RuntimeError("Unable to prepare local mftool package for AMFI access.")
+    # 2) Last resort: pip-install from GitHub (still mftool, not MFAPI)
+    try:
+        import subprocess, sys as _sys
+        url = "git+https://github.com/NayakwadiS/mftool.git@v2.5#egg=mftool"
+        subprocess.check_call([_sys.executable, "-m", "pip", "install", url])
+        from mftool import Mftool  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
-_ensure_local_mftool()
-from mftool import Mftool  # local vendored copy
+# Try once at import time (non-fatal)
+_MFTOOL_READY = _ensure_local_mftool()
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -105,6 +103,7 @@ MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
 st.title(APP_NAME)
 
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Data classes
 # ────────────────────────────────────────────────────────────────────────────────
@@ -114,6 +113,7 @@ class SchemeData:
     name: str
     daily_df: pd.DataFrame  # columns: [date, nav]
     month_end_df: pd.DataFrame  # columns: [date, nav]
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Utility & Data Layer
@@ -150,24 +150,35 @@ def parse_schemes_for_amc(navall_text: str, amc_name: str) -> list[tuple[str, st
 
 @st.cache_data(show_spinner=True, ttl=60 * 60)
 def fetch_scheme_nav_dataframe(scheme_code: str) -> pd.DataFrame:
-    """Fetch historical NAV via AMFI using vendored mftool only.
-    Returns DataFrame with columns ['date','nav'] sorted ascending.
     """
-    mf = Mftool()
-    data = mf.get_scheme_historical_nav(scheme_code, as_Dataframe=True)
-    if data is None or data.empty:
-        return pd.DataFrame(columns=["date", "nav"])  # graceful N/A; UI will handle
+    Fetch historical NAV via AMFI using mftool only.
+    If mftool cannot be prepared (network/pip blocked), return empty DF and surface a UI error.
+    """
+    if not _ensure_local_mftool():
+        st.error("mftool is not available on this server (bootstrap failed). "
+                 "Please retry later or vendor the 'mftool/' folder into the repo.")
+        return pd.DataFrame(columns=["date", "nav"])
 
-    df = data.copy().rename_axis("date").reset_index()
-    df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y", errors="coerce")
-    df["nav"]  = pd.to_numeric(df["nav"], errors="coerce")
-    df = df.dropna().sort_values("date", ascending=True).reset_index(drop=True)
-    return df[["date", "nav"]]
+    from mftool import Mftool  # import only after ensure()
+    try:
+        mf = Mftool()
+        data = mf.get_scheme_historical_nav(scheme_code, as_Dataframe=True)
+        if data is None or data.empty:
+            return pd.DataFrame(columns=["date", "nav"])
+
+        df = data.copy().rename_axis("date").reset_index()
+        df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y", errors="coerce")
+        df["nav"]  = pd.to_numeric(df["nav"], errors="coerce")
+        df = df.dropna().sort_values("date", ascending=True).reset_index(drop=True)
+        return df[["date", "nav"]]
+    except Exception as e:
+        st.error(f"Failed to fetch NAV via AMFI/mftool: {e}")
+        return pd.DataFrame(columns=["date", "nav"])
 
 
 def to_month_end(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
-        return pd.DataFrame(columns=["date", "nav"])    
+        return pd.DataFrame(columns=["date", "nav"])
     s = df.copy()
     s['date'] = pd.to_datetime(s['date'])
     s = s.sort_values('date')
@@ -190,11 +201,13 @@ def merge_frames_on_date(frames: list[pd.DataFrame]) -> pd.DataFrame:
     merged = reduce(lambda L, R: pd.merge(L, R, on='date', how='outer'), frames)
     return merged.sort_values('date', ascending=False).reset_index(drop=True)
 
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Session State
 # ────────────────────────────────────────────────────────────────────────────────
 if "watchlist" not in st.session_state:
     st.session_state.watchlist: dict[str, SchemeData] = {}
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Sidebar – AMC → Scheme → Watchlist
@@ -215,7 +228,7 @@ if selected_amc:
     schemes = parse_schemes_for_amc(navall_text, selected_amc)
     q = st.sidebar.text_input("Search scheme")
     filtered = [s for s in schemes if q.lower() in s[1].lower()] if q else schemes
-    show_df = pd.DataFrame(filtered, columns=["Code", "Scheme Name"]) if filtered else pd.DataFrame(columns=["Code", "Scheme Name"]) 
+    show_df = pd.DataFrame(filtered, columns=["Code", "Scheme Name"]) if filtered else pd.DataFrame(columns=["Code", "Scheme Name"])
     st.sidebar.dataframe(show_df, height=250, use_container_width=True)
 
     add_choice = st.sidebar.selectbox(
@@ -246,10 +259,12 @@ if st.session_state.watchlist:
 else:
     st.sidebar.info("Add schemes to see charts & tables.")
 
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Main Tabs
 # ────────────────────────────────────────────────────────────────────────────────
 tab_overview, tab_month_end, tab_performance = st.tabs(["📊 Chart Overview", "📅 Month-End Data", "📈 Performance Analysis"])
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Tab 1 – Chart Overview
@@ -259,11 +274,12 @@ with tab_overview:
     if not st.session_state.watchlist:
         st.info("Add funds to the watchlist from the sidebar.")
     else:
-        col1, col2, col3 = st.columns([1,1,2])
+        col1, col2, col3 = st.columns([1, 1, 2])
         with col1:
             show_month_end = st.checkbox("Show Month-End Only", value=False)
         with col2:
-            scale_to_100 = st.checkbox("Scale NAV to 100 (requires ≥2 funds)", value=False, disabled=(len(st.session_state.watchlist) < 2))
+            scale_to_100 = st.checkbox("Scale NAV to 100 (requires ≥2 funds)", value=False,
+                                       disabled=(len(st.session_state.watchlist) < 2))
         with col3:
             st.caption("When not rebasing, time-range defaults to 'Since inception of latest fund'.")
 
@@ -358,6 +374,7 @@ with tab_overview:
             else:
                 st.info("No data to export yet.")
 
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Tab 2 – Month-End Data
 # ────────────────────────────────────────────────────────────────────────────────
@@ -378,11 +395,13 @@ with tab_month_end:
             merged_display['date'] = merged_display['date'].dt.strftime('%Y-%m-%d')
             st.dataframe(merged_display, use_container_width=True)
 
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Performance helpers (with strict start-date tolerance)
 # ────────────────────────────────────────────────────────────────────────────────
-
-def _pick_start_date_for_period(df: pd.DataFrame, end_date: pd.Timestamp, months: int, tolerance_days: int = 15) -> pd.Timestamp | None:
+def _pick_start_date_for_period(
+    df: pd.DataFrame, end_date: pd.Timestamp, months: int, tolerance_days: int = 15
+) -> pd.Timestamp | None:
     """Pick the first available date >= target (end_date - months), only if
     it falls within `tolerance_days` of the target; else return None.
     Prevents showing 5Y when only ~3Y data exists.
@@ -473,6 +492,7 @@ def calc_fin_year_returns(df: pd.DataFrame) -> list[tuple]:
         rows.append((label, f"{ret:.2f}"))
     return sorted(rows, key=lambda x: x[0], reverse=True)
 
+
 # ────────────────────────────────────────────────────────────────────────────────
 # Tab 3 – Performance Analysis
 # ────────────────────────────────────────────────────────────────────────────────
@@ -525,13 +545,13 @@ with tab_performance:
 
                 # Calendar year
                 cy = calc_calendar_year_returns(filtered)
-                cy_df = pd.DataFrame(cy, columns=["Year", "Return (%)"]) if cy else pd.DataFrame(columns=["Year", "Return (%)"]) 
+                cy_df = pd.DataFrame(cy, columns=["Year", "Return (%)"]) if cy else pd.DataFrame(columns=["Year", "Return (%)"])
                 st.markdown("### Calendar Year Returns")
                 st.dataframe(cy_df, use_container_width=True)
 
                 # Financial year
                 fy = calc_fin_year_returns(filtered)
-                fy_df = pd.DataFrame(fy, columns=["Financial Year", "Return (%)"]) if fy else pd.DataFrame(columns=["Financial Year", "Return (%)"]) 
+                fy_df = pd.DataFrame(fy, columns=["Financial Year", "Return (%)"]) if fy else pd.DataFrame(columns=["Financial Year", "Return (%)"])
                 st.markdown("### Financial Year Returns")
                 st.dataframe(fy_df, use_container_width=True)
 
