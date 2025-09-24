@@ -1,29 +1,31 @@
 """
 Mutual Fund Explorer – Web App (Streamlit)
 -----------------------------------------
-A faithful web conversion of your Tkinter app (V7.2) with the same features:
-- AMC & Scheme discovery via AMFI NAVAll.txt
-- Watchlist & comparison
-- NAV chart with options: Month-End only, Rebase to 100, Time-range (latest/oldest/custom)
-- Month-End merged table
-- Performance Analysis (Period, Calendar Year, Financial Year)
-- Export to Excel
+FINAL VERSION – AMFI via mftool ONLY (no MFAPI)
+• Uses a vendored/bootstrap mftool so it works on Streamlit Cloud even if pip install fails.
+• Features:
+  - AMC & Scheme discovery via AMFI NAVAll.txt
+  - Watchlist & comparison
+  - NAV chart (daily / month-end), optional rebasing to 100, custom start date when rebasing
+  - Month-end merged table
+  - Performance Analysis: Period (1M–10Y & SI), Calendar Year, Financial Year
+  - Excel exports
 
 Run locally:
-1) pip install streamlit pandas requests mftool matplotlib openpyxl
-2) streamlit run mf_explorer_webapp_streamlit.py
+  pip install -r requirements.txt
+  streamlit run mf_explorer_webapp_streamlit.py
 
-Notes:
-- Uses Streamlit caching to speed up repeated requests.
-- If a scheme has sparse data around exact month-end, we choose the latest available row in that month.
-- Dates are handled as pandas timestamps; AMFI date parsing is dd-mm-YYYY.
+Deploy (Streamlit Community Cloud):
+  Push this file + requirements.txt + .streamlit/config.toml to GitHub, then New app → main file path = mf_explorer_webapp_streamlit.py
 """
 
 from __future__ import annotations
 import io
+import sys
 from dataclasses import dataclass
 from functools import reduce
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -32,17 +34,71 @@ from pandas.tseries.offsets import DateOffset
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-# Optional: mftool for convenient AMFI historical NAVs
-try:
-    from mftool import Mftool  # type: ignore
-    _HAS_MFTOOL = True
-except Exception:
-    _HAS_MFTOOL = False
+# ────────────────────────────────────────────────────────────────────────────────
+# Ensure local vendored mftool is available (AMFI-only, no MFAPI)
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _ensure_local_mftool():
+    """Try to import mftool; if it fails, download repo files to a writable folder
+    (./mftool or /tmp/mftool), add that folder to sys.path, then import again.
+    This keeps AMFI (via mftool) as the sole data source.
+    """
+    try:
+        from mftool import Mftool  # noqa: F401
+        return
+    except Exception:
+        pass
+
+    import zipfile
+
+    # Choose a writable base folder
+    candidates = [Path.cwd(), Path("/tmp")]
+    REF = "master"  # you may pin a tag/commit here, e.g., "v2.5" or a SHA
+    ZIP_URL = f"https://codeload.github.com/NayakwadiS/mftool/zip/refs/heads/{REF}"
+
+    for base in candidates:
+        try:
+            pkg_dir = base / "mftool"
+            # Clean if exists
+            if pkg_dir.exists():
+                for p in sorted(pkg_dir.rglob("*"), reverse=True):
+                    if p.is_file():
+                        p.unlink()
+                for p in sorted(pkg_dir.rglob("*"), reverse=True):
+                    if p.is_dir():
+                        p.rmdir()
+            pkg_dir.mkdir(parents=True, exist_ok=True)
+
+            # Download zip
+            r = requests.get(ZIP_URL, timeout=60)
+            r.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                # Top-level dir name in archive (e.g., "mftool-master/")
+                tops = sorted({n.split("/")[0] for n in z.namelist()})
+                top = [t for t in tops if t.startswith("mftool-")][0]
+                needed = ["__init__.py", "mftool.py", "utils.py", "const.json", "scheme_codes.json"]
+                for fn in needed:
+                    with z.open(f"{top}/{fn}") as src, open(pkg_dir / fn, "wb") as dst:
+                        dst.write(src.read())
+
+            # Ensure path and import
+            if str(base) not in sys.path:
+                sys.path.insert(0, str(base))
+            from mftool import Mftool  # noqa: F401
+            return
+        except Exception:
+            continue
+
+    raise RuntimeError("Unable to prepare local mftool package for AMFI access.")
+
+
+_ensure_local_mftool()
+from mftool import Mftool  # local vendored copy
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ────────────────────────────────────────────────────────────────────────────────
-APP_NAME = "Mutual Fund Comparison & Analysis by Avinash"
+APP_NAME = "Mutual Fund Explorer (Performance Analysis V7.2) – Web"
 CHART_COLORS = ['#0078D7', '#E81123', '#00B294', '#F7630C', '#5C2D91', '#00CC6A', '#DA3B01']
 MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
@@ -77,7 +133,7 @@ def parse_amc_names(navall_text: str) -> list[str]:
 
 
 def parse_schemes_for_amc(navall_text: str, amc_name: str) -> list[tuple[str, str]]:
-    """Return list of (scheme_code, scheme_name) for given AMC."""
+    """Return list of (scheme_code, scheme_name) for the given AMC."""
     schemes: list[tuple[str, str]] = []
     is_target = False
     for raw in navall_text.splitlines():
@@ -86,7 +142,7 @@ def parse_schemes_for_amc(navall_text: str, amc_name: str) -> list[tuple[str, st
             is_target = (line == amc_name)
         elif is_target and ";" in line:
             parts = line.split(";")
-            # NAVAll columns example: Code;ISIN Div;ISIN Growth;Scheme Name;Nav;... (varies)
+            # Format varies a bit, but parts[0] is code, parts[3] is scheme name in current layout
             if len(parts) > 5 and parts[0].isdigit():
                 schemes.append((parts[0], parts[3]))
     return schemes
@@ -94,18 +150,17 @@ def parse_schemes_for_amc(navall_text: str, amc_name: str) -> list[tuple[str, st
 
 @st.cache_data(show_spinner=True, ttl=60 * 60)
 def fetch_scheme_nav_dataframe(scheme_code: str) -> pd.DataFrame:
-    """Fetch historical NAV for a scheme as DataFrame [date, nav] ascending."""
-    if not _HAS_MFTOOL:
-        raise RuntimeError(
-            "mftool is required. Please install it via `pip install mftool`."
-        )
+    """Fetch historical NAV via AMFI using vendored mftool only.
+    Returns DataFrame with columns ['date','nav'] sorted ascending.
+    """
     mf = Mftool()
-    data = mf.get_scheme_historical_nav(scheme_code, as_Dataframe=True)  # returns DataFrame
+    data = mf.get_scheme_historical_nav(scheme_code, as_Dataframe=True)
     if data is None or data.empty:
-        return pd.DataFrame(columns=["date", "nav"])
+        return pd.DataFrame(columns=["date", "nav"])  # graceful N/A; UI will handle
+
     df = data.copy().rename_axis("date").reset_index()
     df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y", errors="coerce")
-    df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
+    df["nav"]  = pd.to_numeric(df["nav"], errors="coerce")
     df = df.dropna().sort_values("date", ascending=True).reset_index(drop=True)
     return df[["date", "nav"]]
 
@@ -135,7 +190,6 @@ def merge_frames_on_date(frames: list[pd.DataFrame]) -> pd.DataFrame:
     merged = reduce(lambda L, R: pd.merge(L, R, on='date', how='outer'), frames)
     return merged.sort_values('date', ascending=False).reset_index(drop=True)
 
-
 # ────────────────────────────────────────────────────────────────────────────────
 # Session State
 # ────────────────────────────────────────────────────────────────────────────────
@@ -146,30 +200,35 @@ if "watchlist" not in st.session_state:
 # Sidebar – AMC → Scheme → Watchlist
 # ────────────────────────────────────────────────────────────────────────────────
 st.sidebar.header("1) Select Fund House (AMC)")
-navall_text = fetch_navall_text()
-amcs = parse_amc_names(navall_text)
+try:
+    navall_text = fetch_navall_text()
+    amcs = parse_amc_names(navall_text)
+except Exception as e:
+    st.sidebar.error(f"Failed to load AMCs: {e}")
+    amcs = []
+    navall_text = ""
+
 selected_amc = st.sidebar.selectbox("AMC", amcs, index=0 if amcs else None)
 
 st.sidebar.header("2) Find Scheme")
 if selected_amc:
     schemes = parse_schemes_for_amc(navall_text, selected_amc)
-    # filter by search term
     q = st.sidebar.text_input("Search scheme")
     filtered = [s for s in schemes if q.lower() in s[1].lower()] if q else schemes
     show_df = pd.DataFrame(filtered, columns=["Code", "Scheme Name"]) if filtered else pd.DataFrame(columns=["Code", "Scheme Name"]) 
     st.sidebar.dataframe(show_df, height=250, use_container_width=True)
 
-    # add one-by-one via selectbox to avoid multi-index hassles
     add_choice = st.sidebar.selectbox(
         "Add to comparison", [f"{c} – {n}" for c, n in filtered] if filtered else ["No schemes"], index=0 if filtered else None
     )
     if filtered and st.sidebar.button("➕ Add"):
         code = add_choice.split(" – ", 1)[0]
-        name = dict(filtered).get(code)
+        name_map = dict(filtered)
+        name = name_map.get(code)
         if code in st.session_state.watchlist:
             st.sidebar.info("Already in watchlist.")
         else:
-            with st.spinner(f"Fetching NAV for {name} ({code})..."):
+            with st.spinner(f"Fetching NAV for {name} ({code})…"):
                 data = load_scheme_data(code, name)
             if data.daily_df.empty:
                 st.sidebar.error("No NAV data found for the selected scheme.")
@@ -244,7 +303,6 @@ with tab_overview:
             elif mode == "Since Inception of Oldest Fund":
                 chart_start = min(inception_dates)
             else:
-                # custom
                 month_num = MONTHS.index(custom_month) + 1
                 chart_start = pd.to_datetime(f"{custom_year}-{month_num:02d}-01")
 
@@ -255,7 +313,6 @@ with tab_overview:
                     continue
                 ycol = 'nav'
                 if scale_to_100:
-                    # base is first available from chart_start
                     base = dfp['nav'].iloc[0]
                     if pd.isna(base) or base == 0:
                         continue
@@ -322,12 +379,13 @@ with tab_month_end:
             st.dataframe(merged_display, use_container_width=True)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Performance math helpers
+# Performance helpers (with strict start-date tolerance)
 # ────────────────────────────────────────────────────────────────────────────────
+
 def _pick_start_date_for_period(df: pd.DataFrame, end_date: pd.Timestamp, months: int, tolerance_days: int = 15) -> pd.Timestamp | None:
-    """Pick the first available date >= target (end_date - months),
-    but only if it falls within `tolerance_days` of the target. Otherwise, return None.
-    This prevents reporting 5Y when only ~3Y history exists.
+    """Pick the first available date >= target (end_date - months), only if
+    it falls within `tolerance_days` of the target; else return None.
+    Prevents showing 5Y when only ~3Y data exists.
     """
     target = end_date - DateOffset(months=months)
     mask = df['date'] >= target
@@ -340,12 +398,10 @@ def _pick_start_date_for_period(df: pd.DataFrame, end_date: pd.Timestamp, months
 
 
 def calc_point_to_point_returns(df: pd.DataFrame) -> list[tuple]:
-    """Return list of tuples: (Period, Return %, CAGR %, Start Date, End Date)
-
-    Rules:
-    - For 1M/3M/6M and any period < 1 year of actual data → simple return %.
-    - For >= 1Y of actual data → CAGR %.
-    - If there isn't sufficient history near the target start (within tolerance), output N/A.
+    """List of tuples: (Period, Return %, CAGR %, Start Date, End Date)
+    - < 1 year actual data  → simple return
+    - ≥ 1 year actual data  → CAGR
+    - Insufficient history within tolerance → N/A
     """
     if df.empty:
         return []
