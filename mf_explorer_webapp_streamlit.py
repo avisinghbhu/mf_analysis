@@ -1,31 +1,30 @@
 """
 Mutual Fund Explorer – Web App (Streamlit)
 -----------------------------------------
-FINAL VERSION – AMFI via mftool ONLY (no MFAPI)
-• Uses a vendored/bootstrap mftool so it works on Streamlit Cloud even if pip install fails.
-• Features:
-  - AMC & Scheme discovery via AMFI NAVAll.txt
-  - Watchlist & comparison
-  - NAV chart (daily / month-end), optional rebasing to 100, custom start date when rebasing
-  - Month-end merged table
-  - Performance Analysis: Period (1M–10Y & SI), Calendar Year, Financial Year
-  - Excel exports
+FINAL ONE-TIME VERSION — uses vendored mftool only (no runtime downloads)
+• AMC & Scheme discovery via AMFI NAVAll.txt
+• Watchlist & comparison
+• NAV chart (daily / month-end), optional rebasing to 100 with custom start
+• Month-end merged table
+• Performance Analysis: Period (1M–10Y & SI with tolerance), Calendar Year, Financial Year
+• Excel exports
 
 Run locally:
   pip install -r requirements.txt
   streamlit run mf_explorer_webapp_streamlit.py
 
 Deploy (Streamlit Community Cloud):
-  Push this file + requirements.txt + .streamlit/config.toml to GitHub, then New app → main file path = mf_explorer_webapp_streamlit.py
+  Push this file + requirements.txt + .streamlit/config.toml
+  Main file path = mf_explorer_webapp_streamlit.py
 """
 
 from __future__ import annotations
 import io
-import sys
 from dataclasses import dataclass
 from functools import reduce
 from datetime import datetime
 from pathlib import Path
+import sys
 
 import pandas as pd
 import requests
@@ -34,64 +33,13 @@ from pandas.tseries.offsets import DateOffset
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-
 # ────────────────────────────────────────────────────────────────────────────────
-# Ensure local mftool (AMFI-only). Non-fatal: returns bool and never raises.
+# Use vendored mftool from repo root (./mftool)
 # ────────────────────────────────────────────────────────────────────────────────
-def _ensure_local_mftool() -> bool:
-    try:
-        from mftool import Mftool  # noqa: F401
-        return True
-    except Exception:
-        pass
-
-    # 1) Try vendoring from GitHub ZIP into a writable folder (prefer /tmp)
-    import io as _io, zipfile, sys as _sys, shutil
-    from pathlib import Path as _Path
-    import requests as _requests
-
-    CANDIDATES = [_Path("/tmp"), _Path.cwd()]
-    REF = "v2.5"  # stable tag; change to "master" or a commit SHA if you prefer
-    ZIP_URL = f"https://codeload.github.com/NayakwadiS/mftool/zip/refs/tags/{REF}"
-
-    for base in CANDIDATES:
-        try:
-            pkg_dir = base / "mftool"
-            if pkg_dir.exists():
-                shutil.rmtree(pkg_dir, ignore_errors=True)
-            pkg_dir.mkdir(parents=True, exist_ok=True)
-
-            r = _requests.get(ZIP_URL, timeout=60)
-            r.raise_for_status()
-            with zipfile.ZipFile(_io.BytesIO(r.content)) as z:
-                tops = sorted({n.split("/")[0] for n in z.namelist()})
-                top = [t for t in tops if t.startswith("mftool-")][0]
-                needed = ["__init__.py", "mftool.py", "utils.py", "const.json", "scheme_codes.json"]
-                for fn in needed:
-                    with z.open(f"{top}/{fn}") as src, open(pkg_dir / fn, "wb") as dst:
-                        dst.write(src.read())
-
-            if str(base) not in _sys.path:
-                _sys.path.insert(0, str(base))
-            from mftool import Mftool  # noqa: F401
-            return True
-        except Exception:
-            continue
-
-    # 2) Last resort: pip-install from GitHub (still mftool, not MFAPI)
-    try:
-        import subprocess, sys as _sys
-        url = "git+https://github.com/NayakwadiS/mftool.git@v2.5#egg=mftool"
-        subprocess.check_call([_sys.executable, "-m", "pip", "install", url])
-        from mftool import Mftool  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
-# Try once at import time (non-fatal)
-_MFTOOL_READY = _ensure_local_mftool()
-
+_REPO_ROOT = Path(__file__).resolve().parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))  # ensure local packages take priority
+from mftool import Mftool  # <- vendored package in ./mftool
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -103,7 +51,6 @@ MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 
 st.set_page_config(page_title=APP_NAME, page_icon="📈", layout="wide")
 st.title(APP_NAME)
 
-
 # ────────────────────────────────────────────────────────────────────────────────
 # Data classes
 # ────────────────────────────────────────────────────────────────────────────────
@@ -111,12 +58,11 @@ st.title(APP_NAME)
 class SchemeData:
     code: str
     name: str
-    daily_df: pd.DataFrame  # columns: [date, nav]
-    month_end_df: pd.DataFrame  # columns: [date, nav]
-
+    daily_df: pd.DataFrame  # [date, nav]
+    month_end_df: pd.DataFrame  # [date, nav]
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Utility & Data Layer
+# Data & utils
 # ────────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def fetch_navall_text() -> str:
@@ -125,12 +71,10 @@ def fetch_navall_text() -> str:
     resp.raise_for_status()
     return resp.text
 
-
 def parse_amc_names(navall_text: str) -> list[str]:
     lines = [ln.strip() for ln in navall_text.splitlines()]
     amcs = sorted({ln for ln in lines if ("mutual fund" in ln.lower() and ";" not in ln)}, key=str.casefold)
     return amcs
-
 
 def parse_schemes_for_amc(navall_text: str, amc_name: str) -> list[tuple[str, str]]:
     """Return list of (scheme_code, scheme_name) for the given AMC."""
@@ -142,39 +86,27 @@ def parse_schemes_for_amc(navall_text: str, amc_name: str) -> list[tuple[str, st
             is_target = (line == amc_name)
         elif is_target and ";" in line:
             parts = line.split(";")
-            # Format varies a bit, but parts[0] is code, parts[3] is scheme name in current layout
+            # parts[0] = code, parts[3] = scheme name in current layout
             if len(parts) > 5 and parts[0].isdigit():
                 schemes.append((parts[0], parts[3]))
     return schemes
 
-
 @st.cache_data(show_spinner=True, ttl=60 * 60)
 def fetch_scheme_nav_dataframe(scheme_code: str) -> pd.DataFrame:
     """
-    Fetch historical NAV via AMFI using mftool only.
-    If mftool cannot be prepared (network/pip blocked), return empty DF and surface a UI error.
+    Fetch historical NAV via AMFI using vendored mftool only.
+    Returns DataFrame with columns ['date','nav'] sorted ascending.
     """
-    if not _ensure_local_mftool():
-        st.error("mftool is not available on this server (bootstrap failed). "
-                 "Please retry later or vendor the 'mftool/' folder into the repo.")
+    mf = Mftool()
+    data = mf.get_scheme_historical_nav(scheme_code, as_Dataframe=True)
+    if data is None or data.empty:
         return pd.DataFrame(columns=["date", "nav"])
 
-    from mftool import Mftool  # import only after ensure()
-    try:
-        mf = Mftool()
-        data = mf.get_scheme_historical_nav(scheme_code, as_Dataframe=True)
-        if data is None or data.empty:
-            return pd.DataFrame(columns=["date", "nav"])
-
-        df = data.copy().rename_axis("date").reset_index()
-        df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y", errors="coerce")
-        df["nav"]  = pd.to_numeric(df["nav"], errors="coerce")
-        df = df.dropna().sort_values("date", ascending=True).reset_index(drop=True)
-        return df[["date", "nav"]]
-    except Exception as e:
-        st.error(f"Failed to fetch NAV via AMFI/mftool: {e}")
-        return pd.DataFrame(columns=["date", "nav"])
-
+    df = data.copy().rename_axis("date").reset_index()
+    df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y", errors="coerce")
+    df["nav"]  = pd.to_numeric(df["nav"], errors="coerce")
+    df = df.dropna().sort_values("date", ascending=True).reset_index(drop=True)
+    return df[["date", "nav"]]
 
 def to_month_end(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -182,18 +114,16 @@ def to_month_end(df: pd.DataFrame) -> pd.DataFrame:
     s = df.copy()
     s['date'] = pd.to_datetime(s['date'])
     s = s.sort_values('date')
-    # choose last available row per month, then set date to month-end
+    # last obs each month, then mark date to month-end
     month_end_df = s.groupby(s['date'].dt.to_period('M')).last().reset_index(drop=True)
     if not month_end_df.empty:
         month_end_df['date'] = month_end_df['date'] + pd.offsets.MonthEnd(0)
     return month_end_df.sort_values('date').reset_index(drop=True)
 
-
 def load_scheme_data(code: str, name: str) -> SchemeData:
     daily = fetch_scheme_nav_dataframe(code)
     month_end = to_month_end(daily) if not daily.empty else pd.DataFrame(columns=["date", "nav"])
     return SchemeData(code=code, name=name, daily_df=daily, month_end_df=month_end)
-
 
 def merge_frames_on_date(frames: list[pd.DataFrame]) -> pd.DataFrame:
     if not frames:
@@ -201,13 +131,11 @@ def merge_frames_on_date(frames: list[pd.DataFrame]) -> pd.DataFrame:
     merged = reduce(lambda L, R: pd.merge(L, R, on='date', how='outer'), frames)
     return merged.sort_values('date', ascending=False).reset_index(drop=True)
 
-
 # ────────────────────────────────────────────────────────────────────────────────
 # Session State
 # ────────────────────────────────────────────────────────────────────────────────
 if "watchlist" not in st.session_state:
     st.session_state.watchlist: dict[str, SchemeData] = {}
-
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Sidebar – AMC → Scheme → Watchlist
@@ -259,12 +187,12 @@ if st.session_state.watchlist:
 else:
     st.sidebar.info("Add schemes to see charts & tables.")
 
-
 # ────────────────────────────────────────────────────────────────────────────────
 # Main Tabs
 # ────────────────────────────────────────────────────────────────────────────────
-tab_overview, tab_month_end, tab_performance = st.tabs(["📊 Chart Overview", "📅 Month-End Data", "📈 Performance Analysis"])
-
+tab_overview, tab_month_end, tab_performance = st.tabs(
+    ["📊 Chart Overview", "📅 Month-End Data", "📈 Performance Analysis"]
+)
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Tab 1 – Chart Overview
@@ -283,7 +211,7 @@ with tab_overview:
         with col3:
             st.caption("When not rebasing, time-range defaults to 'Since inception of latest fund'.")
 
-        # Time range controls
+        # Time range controls (only when rebasing)
         if scale_to_100:
             mode = st.radio(
                 "Chart Time Range",
@@ -292,10 +220,7 @@ with tab_overview:
             )
             custom_month = st.selectbox("Start Month", MONTHS, index=datetime.now().month - 1, key="custom_month")
             custom_year = st.selectbox(
-                "Start Year",
-                options=list(range(datetime.now().year, 1990, -1)),
-                index=0,
-                key="custom_year",
+                "Start Year", options=list(range(datetime.now().year, 1990, -1)), index=0, key="custom_year"
             )
         else:
             mode = "Since Inception of Latest Fund"
@@ -374,7 +299,6 @@ with tab_overview:
             else:
                 st.info("No data to export yet.")
 
-
 # ────────────────────────────────────────────────────────────────────────────────
 # Tab 2 – Month-End Data
 # ────────────────────────────────────────────────────────────────────────────────
@@ -395,15 +319,13 @@ with tab_month_end:
             merged_display['date'] = merged_display['date'].dt.strftime('%Y-%m-%d')
             st.dataframe(merged_display, use_container_width=True)
 
-
 # ────────────────────────────────────────────────────────────────────────────────
-# Performance helpers (with strict start-date tolerance)
+# Performance helpers (strict start-date tolerance prevents wrong-period results)
 # ────────────────────────────────────────────────────────────────────────────────
 def _pick_start_date_for_period(
     df: pd.DataFrame, end_date: pd.Timestamp, months: int, tolerance_days: int = 15
 ) -> pd.Timestamp | None:
-    """Pick the first available date >= target (end_date - months), only if
-    it falls within `tolerance_days` of the target; else return None.
+    """Pick first available date >= (end - months) if within tolerance_days.
     Prevents showing 5Y when only ~3Y data exists.
     """
     target = end_date - DateOffset(months=months)
@@ -415,16 +337,10 @@ def _pick_start_date_for_period(
         return None
     return candidate
 
-
 def calc_point_to_point_returns(df: pd.DataFrame) -> list[tuple]:
-    """List of tuples: (Period, Return %, CAGR %, Start Date, End Date)
-    - < 1 year actual data  → simple return
-    - ≥ 1 year actual data  → CAGR
-    - Insufficient history within tolerance → N/A
-    """
+    """(Period, Return %, CAGR %, Start Date, End Date) with tolerance."""
     if df.empty:
         return []
-
     end_date = pd.to_datetime(df['date'].iloc[-1])
     end_nav = float(df['nav'].iloc[-1])
     inception_date = pd.to_datetime(df['date'].iloc[0])
@@ -432,7 +348,6 @@ def calc_point_to_point_returns(df: pd.DataFrame) -> list[tuple]:
 
     periods = {"1M": 1, "3M": 3, "6M": 6, "1Y": 12, "3Y": 36, "5Y": 60, "10Y": 120}
     out: list[tuple] = []
-
     for label, months in periods.items():
         start_date = _pick_start_date_for_period(df, end_date, months, tolerance_days=15)
         if start_date is None:
@@ -455,9 +370,7 @@ def calc_point_to_point_returns(df: pd.DataFrame) -> list[tuple]:
     else:
         si_ret = ((end_nav / inception_nav) - 1) * 100
         out.append(("Since Inception", f"{si_ret:.2f}", "N/A", inception_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')))
-
     return out
-
 
 def calc_calendar_year_returns(df: pd.DataFrame) -> list[tuple]:
     if df.empty:
@@ -473,7 +386,6 @@ def calc_calendar_year_returns(df: pd.DataFrame) -> list[tuple]:
         ret = ((end_nav / start_nav) - 1) * 100
         rows.append((str(yr), f"{ret:.2f}"))
     return sorted(rows, key=lambda x: x[0], reverse=True)
-
 
 def calc_fin_year_returns(df: pd.DataFrame) -> list[tuple]:
     if df.empty:
@@ -491,7 +403,6 @@ def calc_fin_year_returns(df: pd.DataFrame) -> list[tuple]:
         label = f"FY {fy-1}-{str(fy)[-2:]}"
         rows.append((label, f"{ret:.2f}"))
     return sorted(rows, key=lambda x: x[0], reverse=True)
-
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Tab 3 – Performance Analysis
